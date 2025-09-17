@@ -6,7 +6,7 @@ from road import Road
 import database
 
 # ================= CONFIGURATION =================
-SAMPLE_RATE = 44100       # Microphone sample rate
+SAMPLE_RATE = 48000       # Microphone sample rate
 DURATION = 0.5            # Seconds per audio capture
 SIREN_FREQ_RANGE = (650, 1700)  # Hz range for ambulance siren
 SIREN_THRESHOLD = 50.0          # Energy threshold for siren
