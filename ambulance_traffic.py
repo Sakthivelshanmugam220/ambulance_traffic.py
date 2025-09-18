@@ -5,15 +5,14 @@ import RPi.GPIO as GPIO
 from road import Road
 import database
 
-# ================= CONFIGURATION =================
-SAMPLE_RATE = 48000       # Microphone sample rate
-DURATION = 0.5            # Seconds per audio capture
-SIREN_FREQ_RANGE = (650, 1700)  # Hz range for ambulance siren
-SIREN_THRESHOLD = 50.0          # Energy threshold for siren
+# ================= CONFIG =================
+SAMPLE_RATE = 48000
+DURATION = 0.5
+SIREN_FREQ_RANGE = (650, 1700)
+SIREN_THRESHOLD = 50.0
 
-# ================= GPIO SETUP =================
-GPIO.setmode(GPIO.BCM)  # Use BCM pin numbering
-# Define GPIO pins for 4 roads: each has GREEN and RED LEDs
+# GPIO setup
+GPIO.setmode(GPIO.BCM)
 LED_PINS = {
     "Road 1": {"green": 17, "red": 27},
     "Road 2": {"green": 22, "red": 10},
@@ -21,22 +20,18 @@ LED_PINS = {
     "Road 4": {"green": 5, "red": 6}
 }
 
-# Initialize GPIO pins
 for road_pins in LED_PINS.values():
     GPIO.setup(road_pins["green"], GPIO.OUT)
     GPIO.setup(road_pins["red"], GPIO.OUT)
     GPIO.output(road_pins["green"], GPIO.LOW)
-    GPIO.output(road_pins["red"], GPIO.HIGH)  # Start with red on all roads
+    GPIO.output(road_pins["red"], GPIO.HIGH)
 
-# ================= DATABASE & ROADS =================
-database.create_database()  # Initialize database
-
+# Database and roads
+database.create_database()
 road1 = Road("Road 1", 40, 1000, 300, 1)
 road2 = Road("Road 2", 60, 800, 300, 2)
 road3 = Road("Road 3", 70, 1100, 300, 1.7)
 road4 = Road("Road 4", 30, 700, 300, 1.2)
-
-# Link roads in a loop
 road1.next, road2.next, road3.next, road4.next = road2, road3, road4, road1
 roads = [road1, road2, road3, road4]
 
@@ -44,21 +39,27 @@ active_road = road1
 active_road.turn_green()
 GPIO.output(LED_PINS[active_road.get_name()]["green"], GPIO.HIGH)
 GPIO.output(LED_PINS[active_road.get_name()]["red"], GPIO.LOW)
-
 start_time = time.time()
 road_timestamp, camera_timestamp = None, None
 
 print("System started. Monitoring for ambulance sirens and traffic cycles...")
 
-# ================= HELPER FUNCTIONS =================
+# ================= HELPERS =================
 def capture_audio():
-    """Capture audio sample from microphone and return flattened array."""
-    audio = sd.rec(int(DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='float32')
-    sd.wait()
-    return audio.flatten()
+    """Capture audio sample from microphone."""
+    try:
+        audio = sd.rec(int(DURATION*SAMPLE_RATE), samplerate=SAMPLE_RATE,
+                       channels=1, dtype='int16')
+        sd.wait()
+        return audio.flatten()
+    except Exception as e:
+        print("Audio capture error:", e)
+        return None
 
 def detect_siren(audio):
-    """Detect ambulance siren based on frequency range energy."""
+    """Return True if ambulance siren detected."""
+    if audio is None:
+        return False
     spectrum = np.fft.rfft(audio)
     freqs = np.fft.rfftfreq(len(audio), 1/SAMPLE_RATE)
     power = np.abs(spectrum)
@@ -66,7 +67,6 @@ def detect_siren(audio):
     return siren_power > SIREN_THRESHOLD
 
 def set_road_lights(active):
-    """Set GPIO LEDs: active road green, others red."""
     for road in roads:
         if road == active:
             GPIO.output(LED_PINS[road.get_name()]["green"], GPIO.HIGH)
@@ -84,14 +84,15 @@ try:
         if camera_timestamp is None:
             camera_timestamp = curr_time
 
-        # ---- AUDIO CAPTURE ----
+        # ---- AUDIO ----
         audio = capture_audio()
         if detect_siren(audio):
-            road1.set_hasEmergencyVehicle(True)  # Assign to Road 1 for demo
+            print("🚨 Emergency detected!")
+            road1.set_hasEmergencyVehicle(True)
         else:
             road1.set_hasEmergencyVehicle(False)
 
-        # ---- NORMAL TRAFFIC LIGHT CYCLE ----
+        # ---- NORMAL TRAFFIC CYCLE ----
         if curr_time - start_time > active_road.get_green_time():
             active_road.turn_red()
             active_road = active_road.next
@@ -103,18 +104,16 @@ try:
         # ---- EMERGENCY PRIORITY ----
         for road in roads:
             if road.get_hasEmergencyVehicle():
-                print(f"🚨 Emergency detected on {road.get_name()}! Giving priority.")
-                # Turn all red first
+                print(f"[Emergency Priority] Green light: {road.get_name()}")
                 for r in roads:
                     r.turn_red()
-                # Turn only emergency road green
                 road.turn_green()
                 active_road = road
                 start_time = curr_time
                 set_road_lights(active_road)
                 break
 
-        # ---- VEHICLE COUNTS UPDATE ----
+        # ---- VEHICLE COUNT UPDATE ----
         if curr_time - road_timestamp > 1:
             print("\n[Vehicle Counts Update]")
             for road in roads:
@@ -128,5 +127,6 @@ try:
             camera_timestamp = curr_time
 
 except KeyboardInterrupt:
-    print("\nExiting program and cleaning up GPIO...")
+    print("\nExiting program...")
     GPIO.cleanup()
+
