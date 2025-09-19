@@ -1,132 +1,78 @@
-import time
-import numpy as np
+#!/usr/bin/env python3
 import sounddevice as sd
+import numpy as np
 import RPi.GPIO as GPIO
-from road import Road
-import database
+from scipy.signal import butter, lfilter
 
-# ================= CONFIG =================
-SAMPLE_RATE = 48000
-DURATION = 0.5
-SIREN_FREQ_RANGE = (650, 1700)
-SIREN_THRESHOLD = 50.0
+# -------- CONFIGURATION --------
+SAMPLE_RATE = 16000         # Hz supported by your USB mic
+CHUNK = 2048                # Samples per block (~0.13 s)
+SIREN_BAND = (600, 1800)    # Hz – adjust if your local sirens differ
+POWER_THRESH = 0.25         # Relative spectral power threshold
+FRAMES_REQUIRED = 5         # Number of consecutive detections
+DEVICE = 'hw:2,0'           # From `arecord -l`
 
-# GPIO setup
+GREEN = 17   # BCM for pin 11
+RED = 27     # BCM for pin 13
+
+# -------- SETUP GPIO --------
 GPIO.setmode(GPIO.BCM)
-LED_PINS = {
-    "Road 1": {"green": 17, "red": 27},
-    "Road 2": {"green": 22, "red": 10},
-    "Road 3": {"green": 9, "red": 11},
-    "Road 4": {"green": 5, "red": 6}
-}
+GPIO.setup(GREEN, GPIO.OUT)
+GPIO.setup(RED, GPIO.OUT)
+GPIO.output(GREEN, True)
+GPIO.output(RED, False)
 
-for road_pins in LED_PINS.values():
-    GPIO.setup(road_pins["green"], GPIO.OUT)
-    GPIO.setup(road_pins["red"], GPIO.OUT)
-    GPIO.output(road_pins["green"], GPIO.LOW)
-    GPIO.output(road_pins["red"], GPIO.HIGH)
+# -------- FILTER HELPERS --------
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs
+    b, a = butter(order, [lowcut/nyq, highcut/nyq], btype='band')
+    return b, a
 
-# Database and roads
-database.create_database()
-road1 = Road("Road 1", 40, 1000, 300, 1)
-road2 = Road("Road 2", 60, 800, 300, 2)
-road3 = Road("Road 3", 70, 1100, 300, 1.7)
-road4 = Road("Road 4", 30, 700, 300, 1.2)
-road1.next, road2.next, road3.next, road4.next = road2, road3, road4, road1
-roads = [road1, road2, road3, road4]
+def bandpass_filter(data, lowcut, highcut, fs):
+    b, a = butter_bandpass(lowcut, highcut, fs)
+    return lfilter(b, a, data)
 
-active_road = road1
-active_road.turn_green()
-GPIO.output(LED_PINS[active_road.get_name()]["green"], GPIO.HIGH)
-GPIO.output(LED_PINS[active_road.get_name()]["red"], GPIO.LOW)
-start_time = time.time()
-road_timestamp, camera_timestamp = None, None
+# -------- SIREN DETECTION --------
+def detect_siren(block):
+    # Band-pass filter
+    filtered = bandpass_filter(block, SIREN_BAND[0], SIREN_BAND[1], SAMPLE_RATE)
 
-print("System started. Monitoring for ambulance sirens and traffic cycles...")
+    # FFT magnitude
+    spectrum = np.abs(np.fft.rfft(filtered))
+    band_power = np.sum(spectrum)
+    total_power = np.sum(np.abs(np.fft.rfft(block))) + 1e-8
 
-# ================= HELPERS =================
-def capture_audio():
-    """Capture audio sample from microphone."""
-    try:
-        audio = sd.rec(int(DURATION*SAMPLE_RATE), samplerate=SAMPLE_RATE,
-                       channels=1, dtype='int16')
-        sd.wait()
-        return audio.flatten()
-    except Exception as e:
-        print("Audio capture error:", e)
-        return None
+    # Relative energy in band
+    ratio = band_power / total_power
+    return ratio > POWER_THRESH
 
-def detect_siren(audio):
-    """Return True if ambulance siren detected."""
-    if audio is None:
-        return False
-    spectrum = np.fft.rfft(audio)
-    freqs = np.fft.rfftfreq(len(audio), 1/SAMPLE_RATE)
-    power = np.abs(spectrum)
-    siren_power = power[(freqs >= SIREN_FREQ_RANGE[0]) & (freqs <= SIREN_FREQ_RANGE[1])].sum()
-    return siren_power > SIREN_THRESHOLD
+# -------- MAIN LOOP --------
+print("Traffic signal active. Listening for ambulance siren... Press Ctrl+C to stop.")
+detection_count = 0
 
-def set_road_lights(active):
-    for road in roads:
-        if road == active:
-            GPIO.output(LED_PINS[road.get_name()]["green"], GPIO.HIGH)
-            GPIO.output(LED_PINS[road.get_name()]["red"], GPIO.LOW)
-        else:
-            GPIO.output(LED_PINS[road.get_name()]["green"], GPIO.LOW)
-            GPIO.output(LED_PINS[road.get_name()]["red"], GPIO.HIGH)
-
-# ================= MAIN LOOP =================
 try:
-    while True:
-        curr_time = time.time()
-        if road_timestamp is None:
-            road_timestamp = curr_time
-        if camera_timestamp is None:
-            camera_timestamp = curr_time
+    with sd.InputStream(device=DEVICE, channels=1, samplerate=SAMPLE_RATE,
+                        blocksize=CHUNK, dtype='float32') as stream:
+        while True:
+            block, _ = stream.read(CHUNK)
+            block = block[:, 0]
 
-        # ---- AUDIO ----
-        audio = capture_audio()
-        if detect_siren(audio):
-            print("🚨 Emergency detected!")
-            road1.set_hasEmergencyVehicle(True)
-        else:
-            road1.set_hasEmergencyVehicle(False)
+            if detect_siren(block):
+                detection_count += 1
+            else:
+                detection_count = max(detection_count-1, 0)
 
-        # ---- NORMAL TRAFFIC CYCLE ----
-        if curr_time - start_time > active_road.get_green_time():
-            active_road.turn_red()
-            active_road = active_road.next
-            active_road.turn_green()
-            start_time = curr_time
-            set_road_lights(active_road)
-            print(f"[Normal Cycle] Green light: {active_road.get_name()}")
-
-        # ---- EMERGENCY PRIORITY ----
-        for road in roads:
-            if road.get_hasEmergencyVehicle():
-                print(f"[Emergency Priority] Green light: {road.get_name()}")
-                for r in roads:
-                    r.turn_red()
-                road.turn_green()
-                active_road = road
-                start_time = curr_time
-                set_road_lights(active_road)
-                break
-
-        # ---- VEHICLE COUNT UPDATE ----
-        if curr_time - road_timestamp > 1:
-            print("\n[Vehicle Counts Update]")
-            for road in roads:
-                road.update()
-                print(f"{road.get_name()} - Vehicle count: {road.get_vehicle_count()}")
-            road_timestamp = curr_time
-
-        # ---- CAMERA UPDATE SIMULATION ----
-        if curr_time - camera_timestamp > 10:
-            print("\n[Camera Update] All roads updated.")
-            camera_timestamp = curr_time
-
+            if detection_count >= FRAMES_REQUIRED:
+                # Switch to RED for ambulance priority
+                GPIO.output(GREEN, False)
+                GPIO.output(RED, True)
+                print("Ambulance siren detected – priority given.")
+            else:
+                # Normal GREEN signal
+                GPIO.output(GREEN, True)
+                GPIO.output(RED, False)
 except KeyboardInterrupt:
-    print("\nExiting program...")
+    print("Exiting and cleaning up GPIO...")
+finally:
     GPIO.cleanup()
 
