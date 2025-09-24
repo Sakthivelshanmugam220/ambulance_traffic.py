@@ -2,67 +2,79 @@ import numpy as np
 import sounddevice as sd
 import RPi.GPIO as GPIO
 import time
+from scipy.signal import get_window
 
 # ---------------- CONFIGURATION ----------------
-GREEN_PIN = 17       # BCM 17 -> Physical pin 11
-RED_PIN = 27         # BCM 27 -> Physical pin 13
-
-SAMPLE_RATE = 48000  # Supported by USB mic hw:2,0
-CHUNK       = 2048   # Audio block size
-
-SIREN_RANGE = (650, 1700)  # Hz range for ambulance siren
-THRESHOLD   = 0.15          # Detection sensitivity (0–1 normalized)
-
-REQUIRED_FRAMES = 1          # Consecutive frames needed to trigger red LED
+GREEN_PIN = 17   # BCM 17 -> physical pin 11
+RED_PIN   = 27   # BCM 27 -> physical pin 13
+SAMPLE_RATE = 16000       # Match your MATLAB resample rate
+BLOCK_SIZE  = 2048        # Audio block size
+OVERLAP     = 1024        # For STFT
+SIREN_RANGE = (600, 1600) # Ambulance harmonic band (Hz)
+POWER_THRESH = 0.4        # Relative band power threshold
+FLUX_THRESH  = 0.08       # Spectral flux threshold for sweep pattern
+HOLD_TIME    = 4.0        # Seconds to keep GREEN on after detection
 
 # ---------------- GPIO SETUP -------------------
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(GREEN_PIN, GPIO.OUT)
 GPIO.setup(RED_PIN, GPIO.OUT)
+GPIO.output(GREEN_PIN, GPIO.LOW)
+GPIO.output(RED_PIN, GPIO.HIGH)
 
-def set_leds(green_on: bool, red_on: bool):
-    GPIO.output(GREEN_PIN, green_on)
-    GPIO.output(RED_PIN, red_on)
+def spectral_flux(prev_mag, curr_mag):
+    diff = curr_mag - prev_mag
+    diff[diff < 0] = 0
+    return np.sum(diff)
 
-def detect_siren(block):
-    """Return True if siren-like signal is detected in audio block."""
-    windowed = block * np.hanning(len(block))
-    spectrum = np.fft.rfft(windowed)
-    freqs = np.fft.rfftfreq(len(block), 1 / SAMPLE_RATE)
-    magnitude = np.abs(spectrum)
-    magnitude = magnitude / np.max(magnitude + 1e-9)  # normalize
+def detect_siren(block, prev_mag):
+    window = get_window('hamming', BLOCK_SIZE)
+    spectrum = np.fft.rfft(block * window)
+    freqs = np.fft.rfftfreq(BLOCK_SIZE, 1/SAMPLE_RATE)
+    mag = np.abs(spectrum)
 
-    # Average magnitude in siren band
-    siren_band = magnitude[(freqs >= SIREN_RANGE[0]) & (freqs <= SIREN_RANGE[1])]
-    avg_power = np.mean(siren_band) if len(siren_band) > 0 else 0
-    return avg_power > THRESHOLD
+    # Normalize to max magnitude
+    mag /= np.max(mag) if np.max(mag) > 0 else 1
 
-print("Traffic signal active. Listening for ambulance siren... Press Ctrl+C to stop.")
+    # Band power in siren range
+    band = (freqs >= SIREN_RANGE[0]) & (freqs <= SIREN_RANGE[1])
+    band_power = np.mean(mag[band]) if np.any(band) else 0
 
-consecutive = 0
+    # Spectral flux for sweeping pattern
+    flux = spectral_flux(prev_mag, mag)
+
+    # Decision: strong band power + noticeable sweep
+    siren_detected = band_power > POWER_THRESH and flux > FLUX_THRESH
+    return siren_detected, mag
+
+print("Listening for ambulance siren... Ctrl+C to exit.")
 
 try:
-    with sd.InputStream(device="hw:2,0", channels=1,
-                        samplerate=SAMPLE_RATE, blocksize=CHUNK) as stream:
+    prev_mag = np.zeros(BLOCK_SIZE//2+1)
+    last_detect = 0
+    with sd.InputStream(channels=1, samplerate=SAMPLE_RATE,
+                        blocksize=BLOCK_SIZE, dtype='float32') as stream:
         while True:
-            audio, _ = stream.read(CHUNK)
+            audio, _ = stream.read(BLOCK_SIZE)
             audio = audio.flatten()
-            if detect_siren(audio):
-                consecutive += 1
-            else:
-                consecutive = 0
+            detected, prev_mag = detect_siren(audio, prev_mag)
 
-            if consecutive >= REQUIRED_FRAMES:
-                # Siren detected: Red on, Green off
-                set_leds(False, True)
-                print("Ambulance siren detected! Red LED ON")
+            now = time.time()
+            if detected:
+                last_detect = now
+                print("Ambulance siren detected! GREEN ON.")
+            
+            # Control LEDs: GREEN when siren detected recently
+            if now - last_detect < HOLD_TIME:
+                GPIO.output(RED_PIN, GPIO.LOW)
+                GPIO.output(GREEN_PIN, GPIO.HIGH)
             else:
-                # Normal traffic: Green on, Red off
-                set_leds(True, False)
-
-            time.sleep(0.1)  # adjust speed of loop
+                GPIO.output(GREEN_PIN, GPIO.LOW)
+                GPIO.output(RED_PIN, GPIO.HIGH)
+            
+            time.sleep(0.05)
 
 except KeyboardInterrupt:
-    print("\nExiting and cleaning up GPIO...")
+    print("\nStopping detection.")
 finally:
     GPIO.cleanup()
