@@ -1,80 +1,170 @@
+
+#!/usr/bin/env python3
+"""
+ambulance_traffic.py
+
+Live ambulance-siren detection for Raspberry Pi using a USB mic (mono).
+Green LED ON normally; Red LED ON when ambulance siren detected.
+
+Dependencies (install in your venv):
+pip install numpy scipy sounddevice RPi.GPIO
+"""
+
+import time
+import collections
 import numpy as np
 import sounddevice as sd
+from scipy.signal import wiener, stft
 import RPi.GPIO as GPIO
-import time
-from scipy.signal import get_window
 
 # ---------------- CONFIGURATION ----------------
-GREEN_PIN = 17   # BCM 17 -> physical pin 11
-RED_PIN   = 27   # BCM 27 -> physical pin 13
-SAMPLE_RATE = 16000       # Match your MATLAB resample rate
-BLOCK_SIZE  = 2048        # Audio block size
-OVERLAP     = 1024        # For STFT
-SIREN_RANGE = (600, 1600) # Ambulance harmonic band (Hz)
-POWER_THRESH = 0.4        # Relative band power threshold
-FLUX_THRESH  = 0.08       # Spectral flux threshold for sweep pattern
-HOLD_TIME    = 4.0        # Seconds to keep GREEN on after detection
+GREEN_PIN = 17              # BCM pin for GREEN (physical pin 11)
+RED_PIN = 27                # BCM pin for RED   (physical pin 13)
 
-# ---------------- GPIO SETUP -------------------
+MIC_DEVICE = "hw:2,0"       # Change if arecord -l shows different card/device
+SAMPLE_RATE = 48000         # USB mic sample rate (use what arecord reported)
+CHANNELS = 1                # mono
+FRAME_SECONDS = 0.5         # process every 0.5 s (latency)
+FRAME_LEN = int(SAMPLE_RATE * FRAME_SECONDS)
+
+# STFT parameters (for spectral analysis)
+NPERSEG = 2048
+NOVERLAP = NPERSEG // 2
+NFFT = 2048
+
+SIREN_MIN_HZ = 600          # lower bound of siren band
+SIREN_MAX_HZ = 1700         # upper bound of siren band
+
+# Detection tuning
+RATIO_THRESHOLD = 6.0       # siren_band_power / background_power ratio required
+SMOOTH_WINDOW = 4           # number of recent decisions to smooth (majority voting)
+HOLD_SECONDS = 3.0          # when detected, hold red for at least this long
+
+# Safety / small constants
+EPS = 1e-9
+
+# ---------------- GPIO SETUP ----------------
 GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
 GPIO.setup(GREEN_PIN, GPIO.OUT)
 GPIO.setup(RED_PIN, GPIO.OUT)
-GPIO.output(GREEN_PIN, GPIO.LOW)
-GPIO.output(RED_PIN, GPIO.HIGH)
 
-def spectral_flux(prev_mag, curr_mag):
-    diff = curr_mag - prev_mag
-    diff[diff < 0] = 0
-    return np.sum(diff)
+def set_normal():
+    GPIO.output(GREEN_PIN, GPIO.HIGH)
+    GPIO.output(RED_PIN, GPIO.LOW)
 
-def detect_siren(block, prev_mag):
-    window = get_window('hamming', BLOCK_SIZE)
-    spectrum = np.fft.rfft(block * window)
-    freqs = np.fft.rfftfreq(BLOCK_SIZE, 1/SAMPLE_RATE)
-    mag = np.abs(spectrum)
+def set_emergency():
+    GPIO.output(GREEN_PIN, GPIO.LOW)
+    GPIO.output(RED_PIN, GPIO.HIGH)
 
-    # Normalize to max magnitude
-    mag /= np.max(mag) if np.max(mag) > 0 else 1
+# initialize normal state
+set_normal()
 
-    # Band power in siren range
-    band = (freqs >= SIREN_RANGE[0]) & (freqs <= SIREN_RANGE[1])
-    band_power = np.mean(mag[band]) if np.any(band) else 0
+# ---------------- Helper functions ----------------
+def process_frame(audio_frame):
+    """
+    audio_frame: 1D numpy array, length FRAME_LEN
+    Returns: detection_score (float) — higher means more likely siren
+    We compute STFT magnitude, sum energy in siren band and in background,
+    then return ratio = siren_power / background_power.
+    """
+    # 1) Denoise a bit with Wiener filter (1D)
+    clean = wiener(audio_frame, mysize=5)
 
-    # Spectral flux for sweeping pattern
-    flux = spectral_flux(prev_mag, mag)
+    # 2) STFT
+    f, t, Zxx = stft(clean, fs=SAMPLE_RATE, window='hamming',
+                     nperseg=NPERSEG, noverlap=NOVERLAP, nfft=NFFT, boundary=None)
+    mag = np.abs(Zxx)
 
-    # Decision: strong band power + noticeable sweep
-    siren_detected = band_power > POWER_THRESH and flux > FLUX_THRESH
-    return siren_detected, mag
+    # 3) Frequency bins for siren band
+    siren_idx = np.where((f >= SIREN_MIN_HZ) & (f <= SIREN_MAX_HZ))[0]
+    if siren_idx.size == 0:
+        return 0.0
 
-print("Listening for ambulance siren... Ctrl+C to exit.")
+    # 4) Compute band powers; average over time frames
+    siren_power = mag[siren_idx, :].sum()
+    total_power = mag.sum()
+    background_power = total_power - siren_power
 
-try:
-    prev_mag = np.zeros(BLOCK_SIZE//2+1)
-    last_detect = 0
-    with sd.InputStream(channels=1, samplerate=SAMPLE_RATE,
-                        blocksize=BLOCK_SIZE, dtype='float32') as stream:
-        while True:
-            audio, _ = stream.read(BLOCK_SIZE)
-            audio = audio.flatten()
-            detected, prev_mag = detect_siren(audio, prev_mag)
+    # normalize by band width to avoid bias
+    siren_power_per_bin = siren_power / (len(siren_idx) + EPS)
+    bg_power_per_bin = background_power / ( (mag.shape[0] - len(siren_idx)) + EPS )
 
-            now = time.time()
-            if detected:
-                last_detect = now
-                print("Ambulance siren detected! GREEN ON.")
-            
-            # Control LEDs: GREEN when siren detected recently
-            if now - last_detect < HOLD_TIME:
-                GPIO.output(RED_PIN, GPIO.LOW)
-                GPIO.output(GREEN_PIN, GPIO.HIGH)
-            else:
-                GPIO.output(GREEN_PIN, GPIO.LOW)
-                GPIO.output(RED_PIN, GPIO.HIGH)
-            
-            time.sleep(0.05)
+    # final ratio
+    ratio = (siren_power_per_bin + EPS) / (bg_power_per_bin + EPS)
+    return ratio
 
-except KeyboardInterrupt:
-    print("\nStopping detection.")
-finally:
-    GPIO.cleanup()
+def majority_vote(queue):
+    """Return True if majority of last SMOOTH_WINDOW entries indicate detection."""
+    if len(queue) < SMOOTH_WINDOW:
+        # require at least some history
+        return sum(queue) > (len(queue) / 2.0)
+    return sum(queue) >= (SMOOTH_WINDOW // 2 + 1)
+
+# ---------------- Main loop ----------------
+def main():
+    print("Starting ambulance siren detection. Press Ctrl+C to stop.")
+    sd.default.samplerate = SAMPLE_RATE
+    sd.default.channels = CHANNELS
+
+    # ring buffer to collect audio frames
+    buf = np.zeros(0, dtype='float32')
+
+    # history of recent boolean decisions for smoothing
+    recent = collections.deque(maxlen=SMOOTH_WINDOW)
+
+    last_emergency_time = 0.0
+
+    try:
+        with sd.InputStream(device=MIC_DEVICE, channels=CHANNELS, samplerate=SAMPLE_RATE, dtype='float32') as stream:
+            while True:
+                # read however many samples to fill one FRAME_LEN chunk
+                needed = FRAME_LEN - buf.size
+                if needed > 0:
+                    data, overflow = stream.read(needed)
+                    if CHANNELS > 1:
+                        data = np.mean(data, axis=1)
+                    else:
+                        data = data.flatten()
+                    buf = np.concatenate((buf, data))
+                if buf.size >= FRAME_LEN:
+                    frame = buf[:FRAME_LEN]
+                    buf = buf[FRAME_LEN:]  # drop processed part
+
+                    # normalize frame energy (prevent level variations from breaking ratio)
+                    frame = frame - np.mean(frame)
+                    max_abs = np.max(np.abs(frame)) + EPS
+                    frame = frame / max_abs
+
+                    # process
+                    score = process_frame(frame)
+                    is_siren = (score >= RATIO_THRESHOLD)
+
+                    recent.append(1 if is_siren else 0)
+                    smoothed = majority_vote(recent)
+
+                    now = time.time()
+                    if smoothed:
+                        # set emergency, update timer
+                        last_emergency_time = now
+                        set_emergency()
+                        print(f"{time.strftime('%H:%M:%S')} - Ambulance detected (score={score:.2f}) - RED ON")
+                    else:
+                        # if we are within hold period after last detection, keep emergency
+                        if now - last_emergency_time < HOLD_SECONDS:
+                            set_emergency()
+                            # do not print repeatedly
+                        else:
+                            set_normal()
+                    # small sleep to avoid busy-loop
+                    time.sleep(0.01)
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user - cleaning up GPIO and exiting.")
+    except Exception as e:
+        print("Error:", e)
+    finally:
+        GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()
