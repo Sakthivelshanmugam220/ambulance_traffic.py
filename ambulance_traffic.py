@@ -3,70 +3,80 @@ import numpy as np
 import RPi.GPIO as GPIO
 import time
 import datetime
+from scipy.signal import butter, lfilter
 
 # === Parameters ===
-SAMPLE_RATE = 44100       # Hz
-DURATION = 2.0            # seconds per recording
-THRESHOLD = 15.0          # stricter threshold to reduce false positives
-SIREN_MIN = 600           # Hz lower bound of ambulance siren
-SIREN_MAX = 1500          # Hz upper bound of ambulance siren
+SAMPLE_RATE = 48000       # Supported USB mic rate
+DURATION = 2.0            # Seconds per audio frame
+THRESHOLD = 15.0          # Energy threshold for detection
+SIREN_MIN = 600           # Min freq of ambulance siren (Hz)
+SIREN_MAX = 1500          # Max freq of ambulance siren (Hz)
 
-# === GPIO setup ===
-RED_PIN = 17
-GREEN_PIN = 27
-
+# === GPIO Setup ===
+RED_LED = 17
+GREEN_LED = 27
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(RED_PIN, GPIO.OUT)
-GPIO.setup(GREEN_PIN, GPIO.OUT)
+GPIO.setup(RED_LED, GPIO.OUT)
+GPIO.setup(GREEN_LED, GPIO.OUT)
 
-# Start with RED ON (normal traffic)
-GPIO.output(RED_PIN, GPIO.HIGH)
-GPIO.output(GREEN_PIN, GPIO.LOW)
+# Default: Green ON, Red OFF
+GPIO.output(RED_LED, GPIO.LOW)
+GPIO.output(GREEN_LED, GPIO.HIGH)
 
+# === Bandpass Filter (Butterworth) ===
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
 
-def detect_ambulance(audio, samplerate):
-    """Return True if ambulance siren is detected in audio"""
+def bandpass_filter(data, lowcut, highcut, fs, order=4):
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = lfilter(b, a, data)
+    return y
+
+# === Siren Detection ===
+def detect_siren(audio, fs):
+    # Apply bandpass filter
+    filtered = bandpass_filter(audio, SIREN_MIN, SIREN_MAX, fs)
+
     # FFT
-    fft_spectrum = np.fft.rfft(audio[:, 0])
-    freqs = np.fft.rfftfreq(len(audio), 1/samplerate)
-    magnitude = np.abs(fft_spectrum)
+    spectrum = np.abs(np.fft.rfft(filtered))
+    freqs = np.fft.rfftfreq(len(filtered), 1/fs)
 
-    # Focus only on siren range
-    siren_band = (freqs >= SIREN_MIN) & (freqs <= SIREN_MAX)
-    score = np.mean(magnitude[siren_band]) / (np.mean(magnitude) + 1e-6)
+    # Energy in siren band
+    mask = (freqs >= SIREN_MIN) & (freqs <= SIREN_MAX)
+    energy = np.sum(spectrum[mask])
 
-    now = datetime.datetime.now().strftime("%H:%M:%S")
-    if score > THRESHOLD:
-        print(f"{now} - Ambulance detected (score={score:.2f})")
-        return True
-    else:
-        print(f"{now} - No ambulance (score={score:.2f})")
-        return False
+    return energy
 
-
+# === Main Loop ===
 try:
-    print("Starting ambulance siren detection. Press Ctrl+C to stop.")
+    print("🚦 Starting ambulance siren detection. Press Ctrl+C to stop.")
+
     while True:
+        # Record from mic
         audio = sd.rec(int(DURATION * SAMPLE_RATE),
                        samplerate=SAMPLE_RATE,
-                       channels=1,
-                       dtype='float64')
+                       channels=1, dtype='float32')
         sd.wait()
 
-        ambulance = detect_ambulance(audio, SAMPLE_RATE)
+        audio = np.squeeze(audio)  # 1D array
 
-        if ambulance:
-            # ✅ GREEN ON when siren detected
-            GPIO.output(GREEN_PIN, GPIO.HIGH)
-            GPIO.output(RED_PIN, GPIO.LOW)
+        score = detect_siren(audio, SAMPLE_RATE)
+
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+
+        if score > THRESHOLD:
+            print(f"{timestamp} - 🚨 Ambulance detected (score={score:.2f}) - RED ON")
+            GPIO.output(RED_LED, GPIO.HIGH)
+            GPIO.output(GREEN_LED, GPIO.LOW)
         else:
-            # ✅ RED ON otherwise
-            GPIO.output(GREEN_PIN, GPIO.LOW)
-            GPIO.output(RED_PIN, GPIO.HIGH)
-
-        time.sleep(0.5)
+            print(f"{timestamp} - Normal traffic (score={score:.2f}) - GREEN ON")
+            GPIO.output(RED_LED, GPIO.LOW)
+            GPIO.output(GREEN_LED, GPIO.HIGH)
 
 except KeyboardInterrupt:
-    print("Interrupted by user - cleaning up GPIO and exiting.")
-finally:
+    print("\n🛑 Interrupted by user - cleaning up GPIO and exiting.")
     GPIO.cleanup()
