@@ -1,82 +1,80 @@
+import RPi.GPIO as GPIO
 import sounddevice as sd
 import numpy as np
-import RPi.GPIO as GPIO
 import time
-import datetime
-from scipy.signal import butter, lfilter
+import signal
+import sys
 
-# === Parameters ===
-SAMPLE_RATE = 48000       # Supported USB mic rate
-DURATION = 2.0            # Seconds per audio frame
-THRESHOLD = 15.0          # Energy threshold for detection
-SIREN_MIN = 600           # Min freq of ambulance siren (Hz)
-SIREN_MAX = 1500          # Max freq of ambulance siren (Hz)
+# ==============================
+# CONFIGURATION
+# ==============================
+SAMPLE_RATE = 44100   # Sample rate in Hz (standard for audio)
+DURATION = 2          # Duration of each recording in seconds
+THRESHOLD = 8.0       # Siren detection threshold (tune this if false triggers occur)
+DEVICE_INDEX = 10     # Input device index (from `python3 -m sounddevice`)
 
-# === GPIO Setup ===
-RED_LED = 17
-GREEN_LED = 27
+# GPIO pin numbers (BCM mode)
+GREEN_LED = 17
+RED_LED = 27
+
+# ==============================
+# SETUP
+# ==============================
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(RED_LED, GPIO.OUT)
 GPIO.setup(GREEN_LED, GPIO.OUT)
+GPIO.setup(RED_LED, GPIO.OUT)
 
-# Default: Green ON, Red OFF
-GPIO.output(RED_LED, GPIO.LOW)
-GPIO.output(GREEN_LED, GPIO.HIGH)
+print("Starting ambulance siren detection. Press Ctrl+C to stop.")
 
-# === Bandpass Filter (Butterworth) ===
-def butter_bandpass(lowcut, highcut, fs, order=4):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
+# ==============================
+# CLEAN EXIT HANDLER
+# ==============================
+def cleanup_and_exit(sig=None, frame=None):
+    print("\nInterrupted by user - cleaning up GPIO and exiting.")
+    GPIO.cleanup()
+    sys.exit(0)
 
-def bandpass_filter(data, lowcut, highcut, fs, order=4):
-    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
-    y = lfilter(b, a, data)
-    return y
+signal.signal(signal.SIGINT, cleanup_and_exit)
 
-# === Siren Detection ===
-def detect_siren(audio, fs):
-    # Apply bandpass filter
-    filtered = bandpass_filter(audio, SIREN_MIN, SIREN_MAX, fs)
+# ==============================
+# DETECTION FUNCTION
+# ==============================
+def detect_ambulance(audio):
+    """
+    Detects ambulance siren using frequency-domain analysis (FFT).
+    Returns score value (higher = stronger siren-like signal).
+    """
+    fft = np.fft.fft(audio.flatten())
+    magnitude = np.abs(fft)
+    score = np.mean(magnitude[1000:2000]) / np.mean(magnitude)  # Example detection logic
+    return score
 
-    # FFT
-    spectrum = np.abs(np.fft.rfft(filtered))
-    freqs = np.fft.rfftfreq(len(filtered), 1/fs)
-
-    # Energy in siren band
-    mask = (freqs >= SIREN_MIN) & (freqs <= SIREN_MAX)
-    energy = np.sum(spectrum[mask])
-
-    return energy
-
-# === Main Loop ===
+# ==============================
+# MAIN LOOP
+# ==============================
 try:
-    print("🚦 Starting ambulance siren detection. Press Ctrl+C to stop.")
-
     while True:
-        # Record from mic
+        # Record audio sample
         audio = sd.rec(int(DURATION * SAMPLE_RATE),
                        samplerate=SAMPLE_RATE,
-                       channels=1, dtype='float32')
+                       channels=1,
+                       dtype='float32',
+                       device=DEVICE_INDEX)
         sd.wait()
 
-        audio = np.squeeze(audio)  # 1D array
-
-        score = detect_siren(audio, SAMPLE_RATE)
-
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        # Detect siren
+        score = detect_ambulance(audio)
 
         if score > THRESHOLD:
-            print(f"{timestamp} - 🚨 Ambulance detected (score={score:.2f}) - RED ON")
-            GPIO.output(RED_LED, GPIO.HIGH)
-            GPIO.output(GREEN_LED, GPIO.LOW)
-        else:
-            print(f"{timestamp} - Normal traffic (score={score:.2f}) - GREEN ON")
-            GPIO.output(RED_LED, GPIO.LOW)
+            print(f"{time.strftime('%H:%M:%S')} - Ambulance detected (score={score:.2f}) - GREEN ON")
             GPIO.output(GREEN_LED, GPIO.HIGH)
+            GPIO.output(RED_LED, GPIO.LOW)
+        else:
+            print(f"{time.strftime('%H:%M:%S')} - No ambulance (score={score:.2f}) - RED ON")
+            GPIO.output(GREEN_LED, GPIO.LOW)
+            GPIO.output(RED_LED, GPIO.HIGH)
+
+        time.sleep(0.5)
 
 except KeyboardInterrupt:
-    print("\n🛑 Interrupted by user - cleaning up GPIO and exiting.")
-    GPIO.cleanup()
+    cleanup_and_exit()
